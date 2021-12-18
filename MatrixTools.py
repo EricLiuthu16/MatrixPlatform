@@ -102,9 +102,9 @@ class Filter(object):
             # 计算过去n天交易量累计不为nan的交易日数，以及交易量为0的交易日数，求二者的比
             trade_I = pd.DataFrame((~np.isnan(vol_matrix)).astype(np.int))
             susp_I = pd.DataFrame((vol_matrix == 0).astype(np.int))
-            for n in range(1, 1+n_days):
-                trade_I += trade_I.shift(n, axis = 1).fillna(0.0)
-                susp_I += susp_I.shift(n, axis = 1).fillna(0.0)
+            for n in range(1, 1 + n_days):
+                trade_I += trade_I.shift(n, axis=1).fillna(0.0)
+                susp_I += susp_I.shift(n, axis=1).fillna(0.0)
             susp_filter = np.where((susp_I / trade_I) >= self.suspend_ratio, np.nan, 1)
 
             # 前n天数据不足，填充为1
@@ -513,7 +513,7 @@ class SingleSorting(object):
         group_ts = {}
         group_acc_ts = {}
         for group in tqdm(range(1, self.n + 1)):
-            filter = np.where(rank == float(group), 1, np.nan)
+            filter = np.where(rank == float(group), 1.0, np.nan)
             group_weight = (weight * filter) / (np.nansum(weight * filter, axis=1).reshape(-1, 1))
 
             # 计算单期收益
@@ -932,31 +932,30 @@ class MultipleSorting(object):
 
 class RiskAdjustor(object):
 
-    def __init__(self, freq='m'):
+    def __init__(self, model='CH3', freq='M'):
 
-        self.monthly_path = '/home/lzy01/毕业设计/data/basic_db/CH3_M.pkl'
-        self.daily_path = ''
-        self.quarterly_path = '/home/lzy01/毕业设计/data/basic_db/CH3_Q.pkl'
+        self.data_path = '/home/lzy01/毕业设计/data/basic_db'
 
-        self.freq = freq
+        self.model_name = model + '_' + freq + '.pkl'
 
-        if self.freq == 'm':
-            self.CH3 = pd.read_pickle(self.monthly_path)
+        if self.model_name == 'CH3_M.pkl':
+            self.CH3 = pd.read_pickle(os.path.join(self.data_path, self.model_name))
             self.CH3['t_idx'] = self.CH3['year'].apply(lambda x: str(x)) + self.CH3['month'].apply(
                 lambda x: str(x).zfill(2))
             self.CH3 = self.CH3[['t_idx', 'smb', 'vmg', 'mktrf']]
 
-        elif self.freq == 'q':
-            self.CH3 = pd.read_pickle(self.quarterly_path)
+        elif self.model_name == 'CH3_Q.pkl':
+            self.CH3 = pd.read_pickle(os.path.join(self.data_path, self.model_name))
             self.CH3['t_idx'] = self.CH3['quarter_code']
             self.CH3 = self.CH3[['t_idx', 'smb', 'vmg', 'mktrf']]
 
-        else:  # TODO
-            self.CH3 = None
+        elif self.model_name == 'FF3_M.pkl':
+            self.CH3 = pd.read_pickle(os.path.join(self.data_path, self.model_name))
+            self.CH3 = self.CH3[['t_idx', 'smb', 'vmg', 'mktrf']]
 
         return
 
-    def CH3Adjust(self, R: pd.DataFrame, t_index='month_idx', r_index='HML'):
+    def CH3adjust(self, R: pd.DataFrame, t_index='month_idx', r_index='HML', if_plot=True):
         """
         对输入的序列进行CH3调整，R是一个dataframe，有一列为t_indx时间戳，如果是日度为pd.datatime格式，如果是月度为YYYYMM字符串
         用于和数据进行合并
@@ -976,16 +975,104 @@ class RiskAdjustor(object):
         X = sm.add_constant(R[['smb', 'vmg', 'mktrf']])
         Y = R[r_index]
 
-        model = sm.GLS(Y, X)
-        result = model.fit()
+        model = sm.OLS(Y, X)
+        # Newy west调整
+        result = model.fit(cov_type='HAC', cov_kwds={'maxlags': 4})
         self.model = result
         alpha = result.params[0]
         t = result.tvalues[0]
+
+        if if_plot:
+            self.plot_exposure(result, R)
+
         return alpha, t
 
-    # TODO
-    def FamaMecbench(self):
-        pass
+    def CAPMadjust(self, R: pd.DataFrame, t_index='month_idx', r_index='HML', if_plot=True):
+        """
+        对输入的序列进行CAPM调整，R是一个dataframe，有一列为t_indx时间戳，如果是日度为pd.datatime格式，如果是月度为YYYYMM字符串
+        用于和数据进行合并
+        :param R:
+        :return:
+        """
+        self.CH3.rename(columns={'t_idx': t_index}, inplace=True)
+
+        R = pd.merge(R, self.CH3, on=[t_index], how='inner') \
+            [[t_index, r_index, 'mktrf']] \
+            .set_index(t_index)
+
+        Y = R[r_index]
+        keep_idx = ~np.isnan(Y)
+
+        R = R.loc[keep_idx, :]
+        X = sm.add_constant(R[['mktrf']])
+        Y = R[r_index]
+
+        model = sm.OLS(Y, X)
+        result = model.fit(cov_type='HAC', cov_kwds={'maxlags': 4})
+        self.model = result
+        alpha = result.params[0]
+        t = result.tvalues[0]
+
+        if if_plot:
+            self.plot_exposure(result, R)
+
+        return alpha, t
+
+    def plot_exposure(self, reg_result, R):
+        """
+        对于分解的结果，将exposure和risk factor进行结合，可视化组合收益的来源
+        :param R: 时间戳为索引的收益率序列和factor序列
+        :param risk_exposure: 回归系数
+
+        :return:
+        """
+        R = R.reset_index()
+        risk_exposure = reg_result.params
+
+        if len(risk_exposure) == 1:
+            X = sm.add_constant(R[['mktrf']])
+            X.columns = ['alpha', 'mktrf']
+        else:
+            X = sm.add_constant(R[['smb', 'vmg', 'mktrf']])
+            X.columns = ['alpha', 'smb', 'vmg', 'mktrf']
+        table = pd.DataFrame({'exposures': [round(x, 3) for x in reg_result.params],
+                              't-value': [round(x, 3) for x in reg_result.tvalues]},
+                             index=X.columns).T
+
+        X_with_exposure = pd.DataFrame(risk_exposure.values.reshape(1, -1) * X.values, columns=X.columns)
+        X_acc = X.cumsum()
+        X_with_exposure_acc = X_with_exposure.cumsum()
+        R_acc = pd.DataFrame(R.iloc[:, 1]).cumsum()
+
+        # ---- plot
+        fig = plt.figure(figsize=(15, 12))
+
+        # - fig1 : return with exposure
+        ax1 = fig.add_subplot(2, 1, 1)
+        R_acc_syn = np.zeros_like(R_acc.values).reshape(-1)
+        for name in X_acc.columns:
+            plt.plot(X_with_exposure_acc[name], marker='o')
+            R_acc_syn += X_with_exposure_acc[name].values.reshape(-1)
+        plt.plot(R_acc, marker='v')
+        plt.plot(R_acc_syn, '--vr')
+        plt.legend(list(X_with_exposure_acc.columns) + ['portfolio return'] + ['portfolio return syn'])
+        plt.title('acc return with exposure')
+        plt.ylabel('acc ret')
+        plt.xticks([])
+        plt.table(cellText=table.values, rowLabels=table.index, colLabels=table.columns)
+
+        # - fig2 : risk factor return
+        ax2 = fig.add_subplot(2, 1, 2)
+        for name in list(X_acc.columns)[1:]:
+            plt.plot(X_acc[name], marker='o')
+        plt.legend(list(X_acc.columns)[1:])
+        plt.title('acc return of risk factor')
+        plt.ylabel('acc ret')
+        plt.xticks(list(range(len(X_acc)))[::4], list(R.iloc[:, 0])[::4])
+
+        plt.suptitle(f'Risk Adjust Plot, rsq = {reg_result.rsquared}', size=15)
+        plt.show()
+
         return
 
 
@@ -1030,7 +1117,7 @@ def get_mispricing_score(factor_dict, names=None, rank_filter=1, directions=None
 
 def get_factor_corr(factor_dict: dict, names: list):
     if len(names) != 2:
-        raise ValueError('请输入正确数量的因子名称！')
+        raise ValueError('请输入正确数量的因子名称!')
     factor1 = factor_dict[names[0]]
     factor2 = factor_dict[names[1]]
 
@@ -1057,6 +1144,120 @@ def get_factor_corr(factor_dict: dict, names: list):
     return corrs
 
 
+class NewyWestTstats(BaseEstimator):
+    __doc__ = """ Newy-West t Stats
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+
+    def tstats(self, X: pd.DataFrame, axis=0):
+        """
+        X : DataFrame, columns or indexs are the name of testing varible
+        """
+        if axis == 0:
+            X = X.T
+        names = X.index.to_list()
+        X = np.array(X.values)
+        summary = np.ones((4, len(X))) * np.nan
+
+        for col in range(len(X)):
+            x = X[col, :]
+            x = x[~np.isnan(x)]
+            ones = np.ones_like(x)
+            results = sm.OLS(x, ones).fit(cov_type='HAC', cov_kwds={'maxlags': 4})
+            summary[0, col] = results.params[0]
+            summary[1, col] = results.bse[0]
+            summary[2, col] = results.tvalues[0]
+            summary[3, col] = results.pvalues[0]
+
+        self.summary = pd.DataFrame(summary, index=['mean', 'stderr', 't-value', 'p-value'], columns=names)
+
+        return self.summary
+
+
+class FamaMacbeth(BaseEstimator):
+    __doc__ = """
+    Fama Macbeth Regression
+    
+    Input: 
+        1) X array-like, [time by entity] multi-index,
+        2) y array-like, [time by entity] multi-index, same lenth as X
+    
+    Method:
+        .fit(X,y) : perform fama-macbeth regression with X,y
+        .all_params(): get all params estimation within regression
+    Attribute:
+        .summary: fama-macbeth regression result summary
+    
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+
+    def fit(self, y, X):
+        """
+        perform fama macbeth regression
+        """
+        # format check
+        if len(X) != len(y):
+            raise Exception('Lenth of X and y are not the same, Check Please')
+        # try:
+        #     assert (X.index.all() == y.index.all())
+        # except Exception as e:
+        #     print(e)
+        #     print('Error with index setting, please keep index of X and index of y exactly the same!')
+
+        # nan cleaning
+        X.index.names, y.index.names = ['time', 'entity'], ['time', 'entity']
+        X = X.reset_index()
+        y = y.reset_index()
+        Xy = X.merge(y, on=['time', 'entity'], how='inner').dropna()
+        X = Xy[X.columns.to_list()]
+        y = Xy[y.columns.to_list()]
+
+        # initialize cross-sectional regression
+        dts = list(set(X['time']))
+        fm_coef = pd.DataFrame(
+            np.ones(
+                shape=(len(dts), len(X.columns) - 1)
+            ),
+            index=dts,
+            columns=['constant'] + X.columns.to_list()[2:]
+        )
+        fm_r2_adj = []
+        fm_number = []
+
+        # cross-sectional-regression
+        for dt in tqdm(dts):
+            X_t = sm.add_constant(X[X['time'] == dt].iloc[:, 2:])
+            y_t = y[y['time'] == dt].iloc[:, 2:]
+            results = sm.OLS(y_t, X_t).fit(cov_type='HAC', cov_kwds={'maxlags': 4})
+            fm_coef.loc[dt, :] = results.params.values
+            fm_r2_adj.append(results.rsquared_adj)
+            fm_number.append(results.nobs)
+        self.__all_params = copy.deepcopy(fm_coef)
+        self.__all_params['r2_adj'] = fm_r2_adj
+        self.__all_params['nobs'] = fm_number
+        self.__all_params.sort_index(inplace=True, ascending=True)
+
+        # Newy-West T
+        self._summary()
+
+        return
+
+    def _summary(self):
+        """
+        perform newy-west t test for FM result
+        """
+        summary = NewyWestTstats().tstats(self.__all_params.iloc[:, :-2])
+        self.summary = summary
+        return
+
+    def all_params(self):
+        return self.__all_params
+
+
 print('--------- Factor Matrix Platform Initiating finished! ----------')
-print('------------------------- Version 1.7 --------------------------')
+print('------------------------- Version 1.8 --------------------------')
 print('------------------------- Author @Lzy --------------------------')
