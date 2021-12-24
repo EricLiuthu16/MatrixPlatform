@@ -121,6 +121,38 @@ class Filter(object):
         return outpur_filter
 
 
+class NewyWestTstats(BaseEstimator):
+    __doc__ = """ Newy-West t Stats
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+
+    def fit(self, X: pd.DataFrame, axis=0, round=4) -> pd.DataFrame:
+        """
+        X : DataFrame, columns or indexs are the name of testing varible
+        """
+        if axis == 0:
+            X = X.T
+        names = X.index.to_list()
+        X = np.array(X.values)
+        summary = np.ones((4, len(X))) * np.nan
+
+        for col in range(len(X)):
+            x = X[col, :]
+            x = x[~np.isnan(x)]
+            ones = np.ones_like(x)
+            results = sm.OLS(x, ones).fit(cov_type='HAC', cov_kwds={'maxlags': 4})
+            summary[0, col] = results.params[0]
+            summary[1, col] = results.bse[0]
+            summary[2, col] = results.tvalues[0]
+            summary[3, col] = results.pvalues[0]
+
+        self.summary = pd.DataFrame(summary.round(round), index=['mean', 'stderr', 't-value', 'p-value'], columns=names)
+
+        return self.summary
+
+
 class EODMatrix(object):
     __doc__ = """
     EOD数据矩阵类，用于生产EOD数据矩阵
@@ -168,7 +200,6 @@ class EODMatrix(object):
         sdt, edt = pd.to_datetime(sdt), pd.to_datetime(edt)
         data_all = data_all[(data_all[self.time_index] >= sdt) & (data_all[self.time_index] <= edt)] \
             [[self.time_index, self.code_index] + names]
-
         codes = list(set(data_all[self.code_index]))
         dates = list(set(data_all[self.time_index]))
         codes.sort()
@@ -538,9 +569,12 @@ class SingleSorting(object):
         ts_mat = self.group_ts[[f'group_{i}_exc' for i in range(1, self.n + 1)]].values
         mean = np.zeros((1, ts_mat.shape[1]))
         t, p = ttest_1samp(a=ts_mat, popmean=mean, axis=0, nan_policy='omit')
+        NWtest = NewyWestTstats().fit(X=ts_mat, axis=0).summary
         self.stats = pd.DataFrame()
         self.stats['t-value'] = list(t)[0]
         self.stats['p-value'] = list(p)[0]
+        self.stats['NW-tvalue'] = NWtest.loc['t-value', :].values
+        self.stats['NW-pvalue'] = NWtest.loc['p-value', :].values
         self.stats.index = [f'group_{i}_exc' for i in range(1, self.n + 1)]
 
         print(' IC calculating')
@@ -566,12 +600,9 @@ class SingleSorting(object):
         self.stats['mean_return_exc'] = np.nanmean(
             self.group_ts[[f'group_{group}_exc' for group in range(1, self.n + 1)]],
             axis=0)
-        self.stats = self.stats[['mean_return_exc', 't-value', 'p-value']]
+        self.stats = self.stats[['mean_return_exc', 't-value', 'p-value', 'NW-tvalue', 'NW-pvalue']]
 
         print(f' analysis finished! total time = {round(time.time() - t0, 2)} s')
-
-        # Fama-Macbeth regression
-
         return
 
     def plot(self, show=True, save=False, fig_path=None):
@@ -955,7 +986,7 @@ class RiskAdjustor(object):
 
         return
 
-    def CH3adjust(self, R: pd.DataFrame, t_index='month_idx', r_index='HML', if_plot=True):
+    def CH3adjust(self, R: pd.DataFrame, t_index='month_idx', r_index='HML', if_plot=False):
         """
         对输入的序列进行CH3调整，R是一个dataframe，有一列为t_indx时间戳，如果是日度为pd.datatime格式，如果是月度为YYYYMM字符串
         用于和数据进行合并
@@ -976,6 +1007,7 @@ class RiskAdjustor(object):
         Y = R[r_index]
 
         model = sm.OLS(Y, X)
+
         # Newy west调整
         result = model.fit(cov_type='HAC', cov_kwds={'maxlags': 4})
         self.model = result
@@ -987,7 +1019,7 @@ class RiskAdjustor(object):
 
         return alpha, t
 
-    def CAPMadjust(self, R: pd.DataFrame, t_index='month_idx', r_index='HML', if_plot=True):
+    def CAPMadjust(self, R: pd.DataFrame, t_index='month_idx', r_index='HML', if_plot=False):
         """
         对输入的序列进行CAPM调整，R是一个dataframe，有一列为t_indx时间戳，如果是日度为pd.datatime格式，如果是月度为YYYYMM字符串
         用于和数据进行合并
@@ -1144,38 +1176,6 @@ def get_factor_corr(factor_dict: dict, names: list):
     return corrs
 
 
-class NewyWestTstats(BaseEstimator):
-    __doc__ = """ Newy-West t Stats
-    """
-
-    def __init__(self) -> None:
-        super().__init__()
-
-    def tstats(self, X: pd.DataFrame, axis=0):
-        """
-        X : DataFrame, columns or indexs are the name of testing varible
-        """
-        if axis == 0:
-            X = X.T
-        names = X.index.to_list()
-        X = np.array(X.values)
-        summary = np.ones((4, len(X))) * np.nan
-
-        for col in range(len(X)):
-            x = X[col, :]
-            x = x[~np.isnan(x)]
-            ones = np.ones_like(x)
-            results = sm.OLS(x, ones).fit(cov_type='HAC', cov_kwds={'maxlags': 4})
-            summary[0, col] = results.params[0]
-            summary[1, col] = results.bse[0]
-            summary[2, col] = results.tvalues[0]
-            summary[3, col] = results.pvalues[0]
-
-        self.summary = pd.DataFrame(summary, index=['mean', 'stderr', 't-value', 'p-value'], columns=names)
-
-        return self.summary
-
-
 class FamaMacbeth(BaseEstimator):
     __doc__ = """
     Fama Macbeth Regression
@@ -1185,7 +1185,7 @@ class FamaMacbeth(BaseEstimator):
         2) y array-like, [time by entity] multi-index, same lenth as X
     
     Method:
-        .fit(X,y) : perform fama-macbeth regression with X,y
+        .fit(y,X) : perform fama-macbeth regression with X,y
         .all_params(): get all params estimation within regression
     Attribute:
         .summary: fama-macbeth regression result summary
@@ -1236,7 +1236,7 @@ class FamaMacbeth(BaseEstimator):
             fm_coef.loc[dt, :] = results.params.values
             fm_r2_adj.append(results.rsquared_adj)
             fm_number.append(results.nobs)
-        self.__all_params = copy.deepcopy(fm_coef)
+        self.__all_params = fm_coef
         self.__all_params['r2_adj'] = fm_r2_adj
         self.__all_params['nobs'] = fm_number
         self.__all_params.sort_index(inplace=True, ascending=True)
@@ -1244,13 +1244,13 @@ class FamaMacbeth(BaseEstimator):
         # Newy-West T
         self._summary()
 
-        return
+        return self
 
     def _summary(self):
         """
         perform newy-west t test for FM result
         """
-        summary = NewyWestTstats().tstats(self.__all_params.iloc[:, :-2])
+        summary = NewyWestTstats().fit(self.__all_params.iloc[:, :-2], axis=0)
         self.summary = summary
         return
 
@@ -1259,5 +1259,5 @@ class FamaMacbeth(BaseEstimator):
 
 
 print('--------- Factor Matrix Platform Initiating finished! ----------')
-print('------------------------- Version 1.8 --------------------------')
+print('------------------------- Version 1.9 --------------------------')
 print('------------------------- Author @Lzy --------------------------')
